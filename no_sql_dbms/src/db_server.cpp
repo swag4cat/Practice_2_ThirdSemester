@@ -14,6 +14,14 @@
 
 using json = nlohmann::json;
 
+struct ClientInfo {
+    int socket;
+    std::string address;
+    std::chrono::steady_clock::time_point connect_time;
+    std::string database;
+    int request_count;
+};
+
 class DBServer {
 private:
     int port;
@@ -23,19 +31,34 @@ private:
     std::mutex collections_mutex;
     std::atomic<int> client_count{0};
 
+    HashMap<ClientInfo*> connected_clients;
+    std::mutex clients_mutex;
+
 public:
     DBServer(int p, const std::string& dir) : port(p), db_dir(dir), client_count(0) {}
 
     ~DBServer() {
+        std::cout << "Saving all collections and cleaning up..." << std::endl;
+
         auto collection_items = collections.items();
         for (auto& pair : collection_items) {
-            delete pair.second;
+            if (pair.second) {
+                pair.second->save();
+                delete pair.second;
+            }
         }
 
         auto mutex_items = db_mutexes.items();
         for (auto& pair : mutex_items) {
             delete pair.second;
         }
+
+        auto client_items = connected_clients.items();
+        for (auto& pair : client_items) {
+            delete pair.second;
+        }
+
+        std::cout << "Server shutdown complete" << std::endl;
     }
 
     void start() {
@@ -88,7 +111,11 @@ public:
             setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
             int current_count = ++client_count;
+
+            add_client(client_socket, current_count);
+
             std::cout << "New client connected. Total clients: " << current_count << std::endl;
+            print_clients_info();
 
             std::thread client_thread(&DBServer::handle_client, this, client_socket);
             client_thread.detach();
@@ -96,9 +123,57 @@ public:
     }
 
 private:
+    void add_client(int client_socket, int client_id) {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        ClientInfo* client = new ClientInfo{
+            client_socket,
+            "client_" + std::to_string(client_id),
+            std::chrono::steady_clock::now(),
+            "",
+            0
+        };
+        std::string client_key = "client_" + std::to_string(client_socket);
+        connected_clients.put(client_key, client);
+    }
+
+    void update_client_database(int client_socket, const std::string& db_name) {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::string client_key = "client_" + std::to_string(client_socket);
+        ClientInfo* client = nullptr;
+        if (connected_clients.get(client_key, client)) {
+            client->database = db_name;
+            client->request_count++;
+        }
+    }
+
+    void remove_client(int client_socket) {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::string client_key = "client_" + std::to_string(client_socket);
+        ClientInfo* client = nullptr;
+        if (connected_clients.get(client_key, client)) {
+            connected_clients.remove(client_key);
+            delete client;
+            std::cout << "Client " << client_key << " removed from HashMap" << std::endl;
+        }
+    }
+
+    void print_clients_info() {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        auto clients = connected_clients.items();
+        std::cout << "Connected clients (" << clients.size() << "):" << std::endl;
+        for (const auto& pair : clients) {
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - pair.second->connect_time);
+            std::cout << "  • " << pair.first << " - DB: "
+            << (pair.second->database.empty() ? "none" : pair.second->database)
+            << ", requests: " << pair.second->request_count
+            << ", connected: " << duration.count() << "s" << std::endl;
+        }
+    }
+
     void handle_client(int client_socket) {
         char buffer[4096] = {0};
-        std::cout << "Client handler started" << std::endl;
+        std::cout << "Client handler started for socket " << client_socket << std::endl;
 
         while (true) {
             memset(buffer, 0, sizeof(buffer));
@@ -115,11 +190,16 @@ private:
                 break;
             }
 
-            std::cout << "Received request from client" << std::endl;
+            std::cout << "Received request from client " << client_socket << std::endl;
 
             try {
                 json request = json::parse(buffer);
                 json response = process_request(request);
+
+                if (request.contains("database")) {
+                    update_client_database(client_socket, request["database"]);
+                }
+
                 std::string response_str = response.dump() + "\n";
 
                 int bytes_sent = send(client_socket, response_str.c_str(), response_str.length(), 0);
@@ -144,9 +224,10 @@ private:
             }
         }
 
+        remove_client(client_socket);
         close(client_socket);
         --client_count;
-        std::cout << "Client handler finished" << std::endl;
+        std::cout << "Client handler finished for socket " << client_socket << std::endl;
     }
 
     json process_request(const json& request) {
@@ -223,6 +304,8 @@ private:
                 }
             }
 
+            coll->save();
+
             return {
                 {"status", "success"},
                 {"message", "Inserted " + std::to_string(inserted_ids.size()) + " documents"},
@@ -237,6 +320,11 @@ private:
 
             try {
                 int deleted_count = coll->remove(request["query"]);
+
+                if (deleted_count > 0) {
+                    coll->save();
+                }
+
                 return {
                     {"status", "success"},
                     {"message", "Deleted " + std::to_string(deleted_count) + " documents"},
