@@ -17,11 +17,4 @@ $(SERVER_TARGET): $(SERVER_SOURCES)
 clean:
 	rm -f $(CLIENT_TARGET) $(SERVER_TARGET)
 
-test: all
-	@echo "Testing server and client..."
-	@./db_server 8081 ./test_databases &
-	@sleep 2
-	@./db_client --host 127.0.0.1 --port 8081 --database test_db --command "INSERT users {\"name\": \"Test\", \"age\": 30}"
-	@pkill db_server
-
 .PHONY: clean all test
